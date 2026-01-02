@@ -50,30 +50,33 @@
 ```bash
 git clone https://github.com/alfred0630/blf-fund-performance.git
 cd blf-fund-performance
-2️⃣ 建立虛擬環境（建議）
-bash
-複製程式碼
+```
+### 2️⃣ 建立虛擬環境（建議）
+
+```bash
 python -m venv .venv
+```
 # Windows
 .\.venv\Scripts\activate
 # macOS / Linux
 source .venv/bin/activate
-3️⃣ 安裝套件
-bash
-複製程式碼
+
+### 3️⃣ 安裝套件
+```bash
+
 pip install -r requirements.txt
 requirements.txt
 
 nginx
-複製程式碼
 requests
 beautifulsoup4
 pdfplumber
 pandas
 openpyxl
-📁 專案結構
-bash
-複製程式碼
+```
+### 📁 專案結構
+```bash
+
 blf-fund-performance/
 ├─ data_pdf/                     # PDF 下載資料
 ├─ blf_returns.xlsx              # 每月更新輸出
@@ -90,12 +93,14 @@ blf-fund-performance/
 ├─ fundgov_parse_csf.py
 ├─ run_all_pro.py                # ✅ 每月自動更新（專業版）
 └─ backfill_history.py           # 🧰 一次性歷史回補
-▶️ 使用方式
-🆕 每月更新最新資料
-bash
-複製程式碼
+
+```
+### ▶️ 使用方式
+#### 🆕 每月更新最新資料
+```bash
 python run_all_pro.py
-流程：
+```
+#### 流程：
 
 下載各基金最新 PDF
 
@@ -104,13 +109,14 @@ python run_all_pro.py
 合併寫入 blf_returns.xlsx
 
 🧰 回補歷史資料（只需跑一次）
-bash
-複製程式碼
+```bash
 python backfill_history.py
-輸出：
+```
 
-複製程式碼
+輸出：
+```
 blf_returns_backfill.xlsx
+```
 📌 不會影響每月更新用的 Excel。
 
 ⚙️ 可攜性與自動化
@@ -121,6 +127,7 @@ blf_returns_backfill.xlsx
 可搭配排程工具使用
 
 Windows 工作排程（範例）
-powershell
-複製程式碼
+```powershell
+
 schtasks /create /sc monthly /mo 1 /tn "BLF Fund Update" /tr "python C:\path\to\run_all_pro.py"
+```
