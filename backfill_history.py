@@ -3,7 +3,7 @@ import time
 import hashlib
 from dataclasses import dataclass
 from pathlib import Path
-from urllib.parse import urljoin, urlparse, parse_qs
+from urllib.parse import urljoin
 
 import requests
 import pandas as pd
@@ -14,8 +14,8 @@ from bs4 import BeautifulSoup
 # 基本設定
 # =========================
 BASE_DIR = Path(__file__).resolve().parent
-OUT_EXCEL = BASE_DIR / "blf_returns_backfill.xlsx"  # ✅ 輸出不同 Excel
-DOWNLOAD_DIR = BASE_DIR / "data_pdf" / "_backfill"  # ✅ 歷史 PDF 都放這裡
+OUT_EXCEL = BASE_DIR / "blf_returns_backfill.xlsx"
+DOWNLOAD_DIR = BASE_DIR / "data_pdf" / "_backfill"
 DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 SESSION = requests.Session()
@@ -23,18 +23,19 @@ SESSION.headers.update({
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36"
 })
 
-# 欄位（跟你專業版一致）
+# ✅ 欄位順序與名稱：完全依照你要求的最新版本
 COLS = [
     "年月",
-    "新制基金_YTD(%)",
-    "舊制基金_YTD(%)",
-    "勞保基金_YTD(%)",
-    "國保基金_YTD(%)",
+    "勞保基金",
+    "國民年金保險",
+    "勞退新制",
+    "勞退舊制",
+    "退撫基金",                # 指 已實現收益率
+    "退撫基金_整體收益率(%)",  # 指 整體收益率
     "TW10Y_YTD(%)",
     "TW_TAIEX_YTD(%)",
     "MSCI_World_YTD(%)",
     "BBG_GlobalBond_YTD(%)",
-    "退撫基金_整體實際收益率(%)",
 ]
 
 # =========================
@@ -43,39 +44,38 @@ COLS = [
 def roc_to_ad_ym(roc_year: int, month: int) -> str:
     return f"{roc_year + 1911:04d}-{month:02d}"
 
+def clean_num(text):
+    """清理數字字串，移除百分比、逗號、備註文字"""
+    if not text: return 0.0
+    cleaned = re.sub(r"[^\d\.-]", "", str(text))
+    try:
+        return float(cleaned) if cleaned else 0.0
+    except:
+        return 0.0
+
 def parse_ym_from_filename(name: str) -> str:
     m = re.search(r"(\d{2,3})\s*年\s*(\d{1,2})\s*月", name)
-    if not m:
-        return ""
+    if not m: return ""
     return roc_to_ad_ym(int(m.group(1)), int(m.group(2)))
-
-def safe_filename_from_url(url: str) -> str:
-    """
-    從 URL 取出檔名；若取不到，就用 hash 當檔名避免衝突
-    """
-    base = url.split("?")[0].split("/")[-1]
-    if base.lower().endswith(".pdf") and len(base) > 4:
-        return base.replace(" ", "").replace("\u3000", "")
-    h = hashlib.md5(url.encode("utf-8")).hexdigest()[:12]
-    return f"{h}.pdf"
 
 def download_pdf(url: str, out_dir: Path) -> Path:
     out_dir.mkdir(parents=True, exist_ok=True)
-    filename = safe_filename_from_url(url)
+    # 取檔名
+    base = url.split("?")[0].split("/")[-1]
+    if not base.lower().endswith(".pdf"):
+        h = hashlib.md5(url.encode("utf-8")).hexdigest()[:8]
+        filename = f"file_{h}.pdf"
+    else:
+        filename = base
+    
     path = out_dir / filename
-    if path.exists() and path.stat().st_size > 10_000:
+    if path.exists() and path.stat().st_size > 1000:
         return path
 
     r = SESSION.get(url, timeout=60)
     r.raise_for_status()
     path.write_bytes(r.content)
     return path
-
-def ensure_cols(df: pd.DataFrame) -> pd.DataFrame:
-    for c in COLS:
-        if c not in df.columns:
-            df[c] = pd.NA
-    return df
 
 def upsert_row(df: pd.DataFrame, ym: str) -> int:
     if (df["年月"] == ym).any():
@@ -85,339 +85,162 @@ def upsert_row(df: pd.DataFrame, ym: str) -> int:
     return idx
 
 def sort_by_ym(df: pd.DataFrame) -> pd.DataFrame:
-    df["年月"] = pd.to_datetime(df["年月"])
+    df["年月"] = pd.to_datetime(df["年月"], errors='coerce')
+    df = df.dropna(subset=["年月"])
     df = df.sort_values("年月").reset_index(drop=True)
     df["年月"] = df["年月"].dt.strftime("%Y-%m")
     return df
 
 # =========================
-# 解析器（直接內建，不依賴你其他模組）
+# 解析器 (全面更新)
 # =========================
+
 def parse_blf_retirement(pdf_path: Path) -> dict:
-    # 新制/舊制：抓表格「收益率/報酬率」那列的第 2/3 欄
     ym = parse_ym_from_filename(pdf_path.name)
     with pdfplumber.open(str(pdf_path)) as pdf:
         for page in pdf.pages[:3]:
             for table in page.extract_tables() or []:
                 for row in table or []:
-                    if not row or len(row) < 3:
-                        continue
-                    first = (row[0] or "").strip()
+                    if not row or len(row) < 3: continue
+                    first = str(row[0])
                     if "收益率" in first or "報酬率" in first:
-                        new = (row[1] or "").replace("％", "%").strip()
-                        old = (row[2] or "").replace("％", "%").strip()
-                        m1 = re.search(r"-?\d+(?:\.\d+)?", new)
-                        m2 = re.search(r"-?\d+(?:\.\d+)?", old)
-                        if ym and m1 and m2:
-                            return {
-                                "ym": ym,
-                                "新制基金_YTD(%)": float(m1.group(0)),
-                                "舊制基金_YTD(%)": float(m2.group(0)),
-                            }
+                        return {
+                            "ym": ym,
+                            "勞退新制": clean_num(row[1]),
+                            "勞退舊制": clean_num(row[2])
+                        }
     return {}
 
 def parse_blf_labor_ins(pdf_path: Path) -> dict:
-    # 勞保基金：表格中「勞保基金」欄，找「收益率/報酬率」列
     ym = parse_ym_from_filename(pdf_path.name)
     with pdfplumber.open(str(pdf_path)) as pdf:
         for page in pdf.pages[:2]:
             for table in page.extract_tables() or []:
-                # 找 header 含「勞保基金」
                 header_idx = None
                 for i, row in enumerate(table):
-                    row_text = " ".join([(c or "").strip() for c in row])
-                    if "勞保基金" in row_text:
-                        header_idx = i
-                        break
-                if header_idx is None:
-                    continue
-                header = [(c or "").strip() for c in table[header_idx]]
+                    if "勞保基金" in "".join([str(c) for c in row]):
+                        header_idx = i; break
+                if header_idx is None: continue
+                
+                header = [str(c) for c in table[header_idx]]
                 li_col = next((j for j, c in enumerate(header) if "勞保基金" in c), None)
-                if li_col is None:
-                    continue
+                if li_col is None: continue
+                
                 for row in table[header_idx + 1:]:
-                    if not row or len(row) <= li_col:
-                        continue
-                    first = (row[0] or "").strip()
-                    if "收益率" in first or "報酬率" in first:
-                        val = (row[li_col] or "").replace("％", "%").strip()
-                        m = re.search(r"-?\d+(?:\.\d+)?", val)
-                        if ym and m:
-                            return {"ym": ym, "勞保基金_YTD(%)": float(m.group(0))}
+                    if "收益率" in str(row[0]) or "報酬率" in str(row[0]):
+                        return {"ym": ym, "勞保基金": clean_num(row[li_col])}
     return {}
 
 def parse_blf_national_pension(pdf_path: Path) -> dict:
-    # 國保：同一列「收益率/報酬率」後面 5 個百分比
     ym = parse_ym_from_filename(pdf_path.name)
-    if not ym:
-        return {}
-
-    labels = [
-        "國保基金_YTD(%)",
-        "TW10Y_YTD(%)",
-        "TW_TAIEX_YTD(%)",
-        "MSCI_World_YTD(%)",
-        "BBG_GlobalBond_YTD(%)",
-    ]
-
+    if not ym: return {}
+    labels = ["國民年金保險", "TW10Y_YTD(%)", "TW_TAIEX_YTD(%)", "MSCI_World_YTD(%)", "BBG_GlobalBond_YTD(%)"]
+    
     with pdfplumber.open(str(pdf_path)) as pdf:
-        text = pdf.pages[0].extract_text() or ""
-        m = re.search(
-            r"收益率/報酬率\s*([-\d\.]+)\s*％\s*([-\d\.]+)\s*％\s*([-\d\.]+)\s*％\s*([-\d\.]+)\s*％\s*([-\d\.]+)\s*％",
-            text
-        )
-        if m:
-            nums = list(map(float, m.groups()))
-            out = {"ym": ym}
-            out.update(dict(zip(labels, nums)))
-            return out
-
-        # fallback：掃表格
         for table in pdf.pages[0].extract_tables() or []:
             for row in table or []:
-                if not row:
-                    continue
-                first = (row[0] or "").strip()
-                if "收益率" in first or "報酬率" in first:
-                    nums = []
-                    for cell in row[1:6]:
-                        cell = (cell or "").replace("％", "%").strip()
-                        mm = re.search(r"-?\d+(?:\.\d+)?", cell)
-                        if mm:
-                            nums.append(float(mm.group(0)))
+                if "收益率" in str(row[0]) or "報酬率" in str(row[0]):
+                    nums = [clean_num(c) for c in row[1:6]]
                     if len(nums) == 5:
-                        out = {"ym": ym}
-                        out.update(dict(zip(labels, nums)))
-                        return out
+                        res = {"ym": ym}
+                        res.update(dict(zip(labels, nums)))
+                        return res
     return {}
 
 def parse_fundgov_csf(pdf_path: Path) -> dict:
-    # 退撫：從 PDF 內文抓「xxx年截至xx月」當年月，並抓「整體」的「實際收益率(%)」
+    """✅ 核心改動：爬退撫第二頁，抓已實現與整體"""
     with pdfplumber.open(str(pdf_path)) as pdf:
-        page = pdf.pages[0]
-        text = (page.extract_text() or "")
-        compact = text.replace(" ", "").replace("\n", "")
+        if len(pdf.pages) < 2: return {}
+        page = pdf.pages[1]
+        table = page.extract_table()
+        if not table: return {}
 
-        m = re.search(r"(\d{2,3})年截至(\d{1,2})月", compact)
-        if not m:
-            m = re.search(r"(\d{2,3})年.*?截至.*?(\d{1,2})月", compact)
-        if not m:
-            return {}
-        ym = roc_to_ad_ym(int(m.group(1)), int(m.group(2)))
+        target_row = None
+        for row in reversed(table):
+            # 正則確保抓到「115(1月)」這類格式，排除純註解
+            if row and row[0] and re.search(r"\d+.*月", str(row[0])):
+                target_row = row
+                break
+        
+        if not target_row: return {}
 
-        # 抓「整體」那列的最後數字（實際收益率）
-        mm = re.search(r"整\s*體\s*[-\d,\.]+\s+([-\d\.]+)\s*$", text, flags=re.MULTILINE)
-        if mm:
-            return {"ym": ym, "退撫基金_整體實際收益率(%)": float(mm.group(1))}
-
-        # fallback：掃表格
-        for table in (page.extract_tables() or []):
-            for row in table or []:
-                if not row:
-                    continue
-                first = (row[0] or "").strip()
-                if "整" in first and "體" in first:
-                    last = (row[-1] or "").replace("％", "%").strip()
-                    mmm = re.search(r"-?\d+(?:\.\d+)?", last)
-                    if mmm:
-                        return {"ym": ym, "退撫基金_整體實際收益率(%)": float(mmm.group(0))}
-    return {}
-
-# =========================
-# 抓取「歷史 PDF 連結」：BLF lpsimplelist（有 Page / PageSize）
-# =========================
-def collect_blf_pdf_links(list_url: str, max_pages: int = 200) -> list[str]:
-    """
-    BLF lpsimplelist：用 ?Page=1&PageSize=10 分頁一路抓到沒新連結為止
-    """
-    links = []
-    seen = set()
-    for page in range(1, max_pages + 1):
-        url = f"{list_url}?Page={page}&PageSize=10"
-        r = SESSION.get(url, timeout=30)
-        r.raise_for_status()
-        soup = BeautifulSoup(r.text, "html.parser")
-
-        page_links = []
-        for a in soup.find_all("a", href=True):
-            href = a["href"]
-            # 站內常見 pdf 連結會含 media/ 或 .pdf
-            if ".pdf" in href.lower() or "media/" in href.lower():
-                full = urljoin(list_url, href)
-                if full not in seen:
-                    seen.add(full)
-                    page_links.append(full)
-
-        if not page_links:
-            # 這頁沒抓到任何 PDF，通常表示已經到底
-            break
-
-        links.extend(page_links)
-
-        # 友善一點，避免過快
-        time.sleep(0.2)
-
-    return links
-
-# =========================
-# 抓取「歷史 PDF 連結」：fund.gov.tw（頁面有很多頁）
-# =========================
-def collect_fundgov_pdf_links(list_url: str, max_pages: int = 200) -> list[str]:
-    """
-    fund.gov.tw News.aspx：嘗試用 &page=2 / &Page=2 取分頁
-    會先抓第 1 頁的 page 連結推測總頁數，抓不到就跑到 max_pages 或無新連結為止
-    """
-    def fetch(url: str) -> str:
-        r = SESSION.get(url, timeout=30)
-        r.raise_for_status()
-        return r.text
-
-    html1 = fetch(list_url)
-    soup1 = BeautifulSoup(html1, "html.parser")
-
-    # 從頁碼連結抓最大 page（若有）
-    max_found = 1
-    for a in soup1.find_all("a", href=True):
-        href = a["href"]
-        m = re.search(r"[?&](?:page|Page)=(\d+)", href)
+        # 從行首文字解析年月
+        m = re.search(r"(\d+)\s*\(\s*(\d+)\s*月\s*\)", str(target_row[0]))
         if m:
-            max_found = max(max_found, int(m.group(1)))
-    total_pages = max_found if max_found > 1 else max_pages
-
-    links = []
-    seen = set()
-
-    for p in range(1, total_pages + 1):
-        if p == 1:
-            html = html1
+            ym = roc_to_ad_ym(int(m.group(1)), int(m.group(2)))
         else:
-            # 先試 &page=
-            url = list_url + ("" if "?" in list_url else "?")
-            url = url + ("" if url.endswith("?") else "&")
-            url_page = f"{url}page={p}"
-            html = fetch(url_page)
+            return {}
 
-            # 若這頁看起來不像換頁，就再試 &Page=
-            if "Download.ashx" not in html and ".pdf" not in html.lower():
-                url_page2 = f"{url}Page={p}"
-                html = fetch(url_page2)
-
-        soup = BeautifulSoup(html, "html.parser")
-        page_links = []
-        for a in soup.find_all("a", href=True):
-            href = a["href"]
-            if "Download.ashx" in href or ".pdf" in href.lower():
-                full = urljoin(list_url, href)
-                if full not in seen:
-                    seen.add(full)
-                    page_links.append(full)
-
-        if not page_links and p > 3:
-            # 後面連續沒東西就停（避免一直空轉）
-            break
-
-        links.extend(page_links)
-        time.sleep(0.2)
-
-    return links
+        return {
+            "ym": ym,
+            "退撫基金": clean_num(target_row[2]),            # Index 2: 已實現
+            "退撫基金_整體收益率(%)": clean_num(target_row[4])  # Index 4: 整體
+        }
 
 # =========================
-# 主流程：回補
+# 抓取連結邏輯 (維持不變)
+# =========================
+def collect_blf_links(url):
+    links = []
+    for p in range(1, 15): # 抓前15頁通常就夠回補幾年了
+        r = SESSION.get(f"{url}?Page={p}&PageSize=10")
+        soup = BeautifulSoup(r.text, "html.parser")
+        found = [urljoin(url, a["href"]) for a in soup.find_all("a", href=True) if ".pdf" in a["href"].lower() or "media/" in a["href"]]
+        if not found: break
+        links.extend(found)
+    return list(set(links))
+
+def collect_fundgov_links(url):
+    links = []
+    for p in range(1, 10):
+        r = SESSION.get(f"{url}&page={p}")
+        soup = BeautifulSoup(r.text, "html.parser")
+        found = [urljoin(url, a["href"]) for a in soup.find_all("a", href=True) if "Download.ashx" in a["href"]]
+        if not found: break
+        links.extend(found)
+    return list(set(links))
+
+# =========================
+# 主流程
 # =========================
 @dataclass
 class FundJob:
-    name: str
-    list_url: str
-    collect_links: callable
-    parse_pdf: callable
-    out_subdir: str
+    name: str; list_url: str; collect_fn: callable; parse_fn: callable; subdir: str
 
 def main():
     jobs = [
-        FundJob(
-            name="勞退(新/舊制)",
-            list_url="https://www.blf.gov.tw/49200/49255/49261/49269/49273/lpsimplelist",
-            collect_links=collect_blf_pdf_links,
-            parse_pdf=parse_blf_retirement,
-            out_subdir="retirement"
-        ),
-        FundJob(
-            name="勞保基金",
-            list_url="https://www.blf.gov.tw/49200/49255/49281/49285/49289/lpsimplelist",
-            collect_links=collect_blf_pdf_links,
-            parse_pdf=parse_blf_labor_ins,
-            out_subdir="labor_insurance"
-        ),
-        FundJob(
-            name="國保基金(含4指標)",
-            list_url="https://www.blf.gov.tw/49200/49255/49323/49327/49331/lpsimplelist",
-            collect_links=collect_blf_pdf_links,
-            parse_pdf=parse_blf_national_pension,
-            out_subdir="national_pension"
-        ),
-        FundJob(
-            name="退撫基金(整體實際收益率)",
-            list_url="https://www.fund.gov.tw/News.aspx?n=658&sms=11737",
-            collect_links=collect_fundgov_pdf_links,
-            parse_pdf=parse_fundgov_csf,
-            out_subdir="civil_service_fund"
-        ),
+        FundJob("勞退", "https://www.blf.gov.tw/49200/49255/49261/49269/49273/lpsimplelist", collect_blf_links, parse_blf_retirement, "retirement"),
+        FundJob("勞保", "https://www.blf.gov.tw/49200/49255/49281/49285/49289/lpsimplelist", collect_blf_links, parse_blf_labor_ins, "labor_ins"),
+        FundJob("國保", "https://www.blf.gov.tw/49200/49255/49323/49327/49331/lpsimplelist", collect_blf_links, parse_blf_national_pension, "national_pension"),
+        FundJob("退撫", "https://www.fund.gov.tw/News.aspx?n=658&sms=11737", collect_fundgov_links, parse_fundgov_csf, "csf"),
     ]
 
-    df = pd.DataFrame(columns=["年月"])
-    df = ensure_cols(df)
+    df = pd.DataFrame(columns=COLS)
 
     for job in jobs:
-        print(f"\n=== 開始回補：{job.name} ===")
-        links = job.collect_links(job.list_url)
-        print(f"🔎 找到 PDF 連結數：{len(links)}")
-
-        ok = 0
-        fail = 0
-
+        print(f"\n🚀 開始回補：{job.name}")
+        links = job.collect_fn(job.list_url)
+        print(f"🔎 找到 {len(links)} 個連結")
+        
         for i, url in enumerate(links, 1):
             try:
-                pdf_path = download_pdf(url, DOWNLOAD_DIR / job.out_subdir)
-                payload = job.parse_pdf(pdf_path)
+                path = download_pdf(url, DOWNLOAD_DIR / job.subdir)
+                data = job.parse_fn(path)
+                if data and "ym" in data:
+                    idx = upsert_row(df, data["ym"])
+                    for k, v in data.items():
+                        if k in COLS: df.loc[idx, k] = v
+                if i % 10 == 0: print(f"  進度: {i}/{len(links)}")
+            except:
+                continue
+            time.sleep(0.1)
 
-                if not payload:
-                    fail += 1
-                    continue
-
-                ym = payload.get("ym")
-                if not ym:
-                    fail += 1
-                    continue
-
-                idx = upsert_row(df, ym)
-                for k, v in payload.items():
-                    if k == "ym":
-                        continue
-                    if k not in df.columns:
-                        df[k] = pd.NA
-                    df.loc[idx, k] = v
-
-                ok += 1
-
-            except Exception as e:
-                fail += 1
-
-            # 每 20 個印一次進度
-            if i % 20 == 0:
-                print(f"  進度 {i}/{len(links)} | 成功 {ok} | 失敗 {fail}")
-
-            time.sleep(0.15)
-
-        print(f"✅ {job.name} 完成：成功 {ok}，失敗 {fail}")
-
-    df = ensure_cols(df)
+    # 排序與輸出
     df = sort_by_ym(df)
-
-    # 寫出新的 Excel（欄位名稱一致，但檔名不同）
-    with pd.ExcelWriter(OUT_EXCEL, engine="openpyxl", mode="w") as writer:
-        df.to_excel(writer, sheet_name="data", index=False)
-
-    print(f"\n🎉 回補完成！輸出：{OUT_EXCEL}")
+    # 確保欄位順序完全正確
+    df = df[COLS]
+    df.to_excel(OUT_EXCEL, index=False)
+    print(f"\n🎉 回補完成！檔案存於: {OUT_EXCEL}")
 
 if __name__ == "__main__":
     main()

@@ -1,7 +1,7 @@
 from pathlib import Path
 import pandas as pd
 
-SHEET_NAME = "data"
+SHEET_NAME = "Sheet1"
 
 def upsert_row(df: pd.DataFrame, ym: str) -> int:
     if "年月" not in df.columns:
